@@ -1,0 +1,150 @@
+name: ML Continuous Deployment
+
+on:
+
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "fix/**"
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+
+jobs:
+
+  test:
+
+    name: Validate ML Service
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+
+
+      - name: Run automated tests
+        run: |
+          pytest -v
+
+
+  deploy-production:
+
+    name: Deploy to Production
+
+    needs:
+      - test
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on:
+      - self-hosted
+
+    defaults:
+      run:
+        shell: powershell
+
+    environment:
+      name: production
+      url: http://127.0.0.1:8000/docs
+
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+
+      - name: Show deployment information
+        run: |
+          echo "Repository: ${{ github.repository }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+
+
+      - name: Show Docker version
+        run: |
+          docker --version
+
+
+      - name: Build deployment image
+        run: |
+          docker build -t ml-cd-api:${{ github.sha }} .
+
+
+      - name: Verify new image exists
+        run: |
+          docker image inspect ml-cd-api:${{ github.sha }}
+
+
+      - name: Remove previous production container
+        run: |
+          $existing = docker ps -aq --filter 'name=^ml-cd-production$'
+          if ($existing) { docker rm -f ml-cd-production }
+
+
+      - name: Start new production container
+        run: |
+          docker run -d --name ml-cd-production --restart unless-stopped -p 8000:8000 -e DEPLOYMENT_VERSION=${{ github.sha }} ml-cd-api:${{ github.sha }}
+
+
+      - name: Show running container
+        run: |
+          docker ps --filter name=ml-cd-production
+
+
+      - name: Wait for application startup
+        run: |
+          Start-Sleep -Seconds 5
+
+
+      - name: Verify production health
+        run: |
+          $response = Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:8000/health -TimeoutSec 10
+          $body = $response.Content | ConvertFrom-Json
+          Write-Output "HTTP Status: $($response.StatusCode)"
+          Write-Output "Response: $($response.Content)"
+          if ($response.StatusCode -ne 200) { throw "Unexpected status code" }
+          if ($body.status -ne "healthy") { throw "Service is not healthy" }
+          if ($body.deployment_version -ne "${{ github.sha }}") { throw "Deployment version mismatch" }
+
+
+      - name: Show production logs
+        if: always()
+        run: |
+          docker logs ml-cd-production --tail 100
+          exit 0
+
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "Deployment successful"
+          echo "Version: ${{ github.sha }}"
+          echo "Swagger: http://127.0.0.1:8000/docs"
+          echo "Health: http://127.0.0.1:8000/health"
